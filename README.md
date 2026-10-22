@@ -1,7 +1,9 @@
-# GNSSLogger Dataset
+# GNSSLogger_data.zip Dataset
 This repository contains raw Global Navigation Satellite System (GNSS) measurement datasets collected using the Android **GNSS Logger** application in two different transportation scenarios:
-- **Car**
-- **Train**
+- **Car:**
+    - Location: Drive in Espoo.
+- **Train:**
+    - Location: Train ride in Frace. The train passes through tunnels, so GNSS is not available for these instances    
 
 ## Dataset Structure
 ```text
