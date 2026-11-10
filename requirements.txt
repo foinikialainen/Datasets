@@ -1,0 +1,4 @@
+# Python packages needed to run compare_apps.py
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
