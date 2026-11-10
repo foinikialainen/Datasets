@@ -571,7 +571,8 @@ def main():
         for label, times in groups.items():
             h = clock_health(times, args.gap_ms, args.backward_ms)
             health[(name, label)] = h
-            say(f"  {label:14s} n={h['n']:7d}  median dt={h['median_dt']:8.1f} ms  "
+            rate = (1000.0 / h["median_dt"]) if h["median_dt"] else float("nan")
+            say(f"  {label:14s} n={h['n']:7d}  median dt={h['median_dt']:8.1f} ms (~{rate:6.2f} Hz)  "
                 f"max dt={h['max_dt']:9.1f} ms  |  1970-jumps={h['n_epoch']}  "
                 f"backward={h['n_backward']}  gaps(>{h['gap_thr_ms']:.0f} ms)={h['n_gap']}")
         # wall-clock vs uptime-clock check on IMU records
@@ -616,6 +617,11 @@ def main():
             ax.scatter(g["lon"], g["lat"], s=4, alpha=0.5, label=f"{name} [{prov}]")
         say(f"  {name}: {len(df)} fixes in overlap, providers: "
             + ", ".join(f"{p}={n}" for p, n in df["provider"].value_counts().items()))
+        for prov, g in df.groupby(df["provider"].fillna("?")):
+            gt = g["time_ms"].to_numpy()
+            if len(gt) > 1:
+                med = float(np.median(np.diff(gt)))
+                say(f"    provider {prov}: {len(g)} fixes, ~{1000.0 / med:.2f} Hz (median dt {med:.0f} ms)")
     ax.set_xlabel("longitude (deg)")
     ax.set_ylabel("latitude (deg)")
     ax.set_title("Position track of both apps (overlap window)")
@@ -627,21 +633,24 @@ def main():
     plt.close(fig)
     say(f"  saved plot: {p}")
 
-    # fix clock plot: time vs record number + dt between consecutive fixes
-    fig, axes = plt.subplots(2, 2, figsize=(13, 8), sharex="col")
+    # fix clock plot: clock value vs record number (left) + dt between consecutive fixes (right)
+    # NOTE: fixes are plotted in the order they were LOGGED (not sorted by time),
+    # so clock jumps show as vertical drops and logging gaps as vertical steps.
+    # The x-axis is the record number (a plain count), the y-axis is the clock
+    # value (a real time), so the time-of-day formatter belongs on the Y axis.
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8))
     for row, (name, app) in enumerate(apps):
-        df = app["fixes"].dropna(subset=["time_ms"]).sort_values("time_ms")
-        if ov_lo is not None:
-            df = df[(df["time_ms"] >= ov_lo) & (df["time_ms"] <= ov_hi)]
-        if len(df) == 0:
+        t = app["fixes"].dropna(subset=["time_ms"])["time_ms"].to_numpy()  # log order
+        if len(t) == 0:
             continue
-        t = df["time_ms"].to_numpy()
         dts = np.diff(t)
         h = health.get((name, "Fix"))
         ax_t, ax_d = axes[row][0], axes[row][1]
         ax_t.plot(np.arange(len(t)), to_dt64(t), lw=0.8)
-        ax_t.set_ylabel(f"{name}\nfix time (UTC)")
-        ax_t.set_title(f"{name}: fix timestamps in order (1970-jumps would drop to the bottom)")
+        ax_t.yaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+        ax_t.set_xlabel("fix number (log order)")
+        ax_t.set_ylabel("fix clock value (UTC)")
+        ax_t.set_title(f"{name}: fix clock in log order (jumps drop down, gaps step up)")
         if h and h["events"]:
             for idx, tp, tt, kind, d in h["events"]:
                 ax_t.axvline(idx, color="red", alpha=0.3)
@@ -651,7 +660,7 @@ def main():
             ax_d.axhline(h["backward_thr_ms"], color="red", ls="--", label=f"backward threshold {h['backward_thr_ms']:.0f} ms")
             ax_d.legend(fontsize=7)
         ax_d.set_ylabel("|dt| between consecutive fixes (ms, log)")
-        ax_d.set_xlabel("fix number")
+        ax_d.set_xlabel("fix number (log order)")
         for idx, tp, tt, kind, d in (h["events"] if h else [])[:200]:
             if kind == "backward":
                 ax_d.plot(idx + 1, abs(d) + 1, "rv", ms=4)
@@ -659,8 +668,7 @@ def main():
                 ax_d.plot(idx + 1, d + 1, "r^", ms=4)
             elif kind == "epoch":
                 ax_d.plot(idx + 1, 1, "ks", ms=4)
-        plot_time_axis(ax_t)
-    fig.suptitle("GNSS fix clock: timestamps vs record number (left) and time steps (right)")
+    fig.suptitle("GNSS fix clock per app: clock value vs record number (left), time steps (right)")
     fig.tight_layout()
     p = os.path.join(args.out, "02_fix_clock.png")
     fig.savefig(p, dpi=130)
@@ -841,6 +849,84 @@ def main():
         fig.savefig(p, dpi=130)
         plt.close(fig)
         say(f"  saved plot: {p}")
+
+    # ------------------------------------- clock comparison: Fix vs IMU accelerometer
+    # The user wants to see the Fix clock (~1 Hz) and the IMU accelerometer clock
+    # (~125/150 Hz) side by side for EACH app. Left column: the clock values
+    # themselves (y = clock value as UTC time, x = sample number in log order),
+    # so a clock jump drops down and a logging gap steps up. Right column: the
+    # time step between consecutive samples (log scale) plotted against the real
+    # UTC time, with Fix and IMU on the SAME time axis, so you can see at which
+    # moments each clock glitched.
+    say("\n" + "=" * 78)
+    say("CLOCK COMPARISON - Fix clock vs IMU accelerometer clock, per app")
+    say("=" * 78)
+    acc_sensor = None
+    for cand in ("ACC_UNCAL", "ACC"):  # prefer the uncalibrated accelerometer
+        if cand in sensors1 and cand in sensors2:
+            acc_sensor = cand
+            break
+    if acc_sensor is None and sensors1 and sensors2:
+        acc_sensor = sorted(sensors1 & sensors2)[0]
+    if acc_sensor:
+        say(f"  accelerometer sensor used for the IMU clock: {acc_sensor}")
+        for name, app in apps:
+            fix_t = app["fixes"].dropna(subset=["time_ms"])["time_ms"].to_numpy()      # log order
+            imu_t = app["imu"][app["imu"]["sensor"] == acc_sensor].dropna(subset=["time_ms"])["time_ms"].to_numpy()
+            if len(fix_t) > 1 and len(imu_t) > 1:
+                fix_span_s = (fix_t.max() - fix_t.min()) / 1000.0
+                imu_span_s = (imu_t.max() - imu_t.min()) / 1000.0
+                say(f"  {name}: Fix clock rate ~{len(fix_t) / fix_span_s:.2f} Hz overall (n={len(fix_t)}, "
+                    f"per-provider rates listed above); IMU {acc_sensor} clock rate "
+                    f"~{len(imu_t) / imu_span_s:.2f} Hz (n={len(imu_t)})")
+        fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+        for row, (name, app) in enumerate(apps):
+            fix_t = app["fixes"].dropna(subset=["time_ms"])["time_ms"].to_numpy()
+            imu_t = app["imu"][app["imu"]["sensor"] == acc_sensor].dropna(subset=["time_ms"])["time_ms"].to_numpy()
+            if len(fix_t) == 0 or len(imu_t) == 0:
+                continue
+            axc, axd = axes[row][0], axes[row][1]
+            # left: clock values vs sample number (IMU downsampled for display only)
+            axc.plot(np.arange(len(fix_t)), to_dt64(fix_t), lw=0.9,
+                     label=f"Fix clock (n={len(fix_t)})")
+            k = max(1, int(math.ceil(len(imu_t) / 20000)))
+            axc.plot(np.arange(0, len(imu_t), k), to_dt64(imu_t[::k]), ".", ms=1,
+                     label=f"IMU {acc_sensor} clock (n={len(imu_t)})")
+            axc.yaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+            axc.set_xlabel("sample number (log order)")
+            axc.set_ylabel("clock value (UTC)")
+            axc.set_title(f"{name}: clock values - Fix vs IMU accelerometer")
+            axc.legend(fontsize=8)
+            axc.grid(alpha=0.3)
+            for lbl in ("Fix", f"IMU:{acc_sensor}"):
+                h = health.get((name, lbl))
+                if h:
+                    for idx, tp, tt, kind, d in h["events"]:
+                        axc.axvline(idx, color="red", alpha=0.25)
+            # right: time step dt vs real UTC time, Fix and IMU on the same axis
+            for lbl, t in (("Fix", fix_t), (f"IMU {acc_sensor}", imu_t)):
+                if len(t) > 1:
+                    d = np.diff(t)
+                    axd.semilogy(to_dt64(t[1:]), np.abs(d) + 1, ".", ms=1.5, label=f"{lbl} dt")
+                    h = health.get((name, "Fix" if lbl == "Fix" else f"IMU:{acc_sensor}"))
+                    if h and h["gap_thr_ms"]:
+                        axd.axhline(h["gap_thr_ms"], ls="--", alpha=0.7,
+                                    label=f"{lbl} gap threshold {h['gap_thr_ms']:.0f} ms")
+            axd.set_ylabel("dt between consecutive samples (ms, log)")
+            axd.set_title(f"{name}: Fix and IMU clock steps on the same UTC time axis")
+            axd.legend(fontsize=7)
+            axd.grid(alpha=0.3, which="both")
+            plot_time_axis(axd)
+        fig.suptitle("Clock comparison per app - left: clock value vs sample number "
+                     "(jumps drop down, gaps step up); right: time step vs UTC time "
+                     "(a glitch in either clock spikes up at the same moment)")
+        fig.tight_layout()
+        p = os.path.join(args.out, "08_clock_fix_vs_imu.png")
+        fig.savefig(p, dpi=130)
+        plt.close(fig)
+        say(f"  saved plot: {p}")
+    else:
+        say("  no common accelerometer sensor found in both apps; skipped")
 
     # ------------------------------------------------------------- raw GNSS
     say("\n" + "=" * 78)
