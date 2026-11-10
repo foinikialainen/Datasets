@@ -239,17 +239,43 @@ def extract_record(tag, colmap, row):
     # IMU sensors (accelerometer / gyroscope / magnetometer, calibrated or not).
     sensor = canonical_sensor(tag)
     if sensor is not None:
-        # The value columns sit right after the 'elapsedRealtimeNanos' column;
-        # skip bias/drift/accuracy columns, keep the first three as x, y, z.
+        # Find the x/y/z value columns. Two naming schemes exist:
+        #  - per-record chunk files: columns right after 'elapsedRealtime...'
+        #    (e.g. UncalAccel,utcTimeMillis,elapsedRealtimeNanos,UncalAccelXMps2,...)
+        #  - the merged wide CSV: one header for all record types, where each
+        #    row only fills ITS OWN sensor columns (e.g. x_uncalibrated_radPerSecond
+        #    for GYR_UNCAL rows, empty for ACC rows).
+        # So we pick columns by the physical UNIT of the sensor (m/s^2 for the
+        # accelerometer, rad/s for the gyroscope, uT for the magnetometer) and
+        # then by axis letter - this works for both naming schemes.
+        base = sensor.replace("_UNCAL", "")
+        unit_tokens = {"ACC": ("mps2", "meterpersecond"),
+                       "GYR": ("radpersec",),
+                       "MAG": ("microt",)}[base]
         elapsed_idx = next((i for n, i in colmap.items() if n.startswith("elapsedrealtime")), -1)
-        value_cols = sorted(
-            i for n, i in colmap.items()
-            if i > elapsed_idx and i < len(row)
-            and "bias" not in n and "drift" not in n and "accuracy" not in n
-        )
-        vals = [to_float(row[i]) for i in value_cols[:3]]
-        while len(vals) < 3:
-            vals.append(None)
+        tag_norm = norm(tag)
+        axis_col = {}
+        for n, i in sorted(colmap.items(), key=lambda kv: kv[1]):
+            if i <= elapsed_idx or "bias" in n or "drift" in n or "accuracy" in n:
+                continue
+            if not any(tok in n for tok in unit_tokens):
+                continue
+            axis = None
+            if tag_norm and n.startswith(tag_norm) and len(n) > len(tag_norm) and n[len(tag_norm)] in "xyz":
+                axis = n[len(tag_norm)]          # e.g. 'UncalAccelXMps2' -> 'x'
+            elif n and n[0] in "xyz":
+                axis = n[0]                       # e.g. 'x_uncalibrated_...' -> 'x'
+            if axis and axis not in axis_col:
+                axis_col[axis] = i
+        if not axis_col:
+            # fallback: first three non-bias/drift/accuracy columns after elapsed
+            fallback = sorted(i for n, i in colmap.items()
+                              if i > elapsed_idx and "bias" not in n and "drift" not in n and "accuracy" not in n)[:3]
+            axis_col = dict(zip("xyz", fallback))
+        vals = []
+        for a in "xyz":
+            i = axis_col.get(a)
+            vals.append(to_float(row[i]) if (i is not None and i < len(row)) else None)
         return {
             "kind": "imu",
             "sensor": sensor,
@@ -317,16 +343,21 @@ def load_app(parent, role):
         name_parser = parse_gnsslogger_filename
     else:
         # The second app splits the recording into fixed-size chunk files
-        # (log_DDMMYYYY-HHMMSS.txt). If no chunks are found, fall back to a
-        # single merged session *.csv (some versions of the app also write it).
+        # (log_DDMMYYYY-HHMMSS.txt). Some versions of the app also write one
+        # merged session *.csv with a single header row (easier to read).
+        # We parse BOTH: the chunks are the primary source, and the CSV is
+        # cross-checked against them (see crosscheck_chunks_vs_csv) so that
+        # any difference between the two is reported instead of assumed.
+        # If no chunk files exist, the CSV alone is used as the primary source.
         chunk_files = find_files(parent, "log_*.txt")
         csv_files = find_files(parent, "*.csv")
         if chunk_files:
             log_files = chunk_files
-            info["skipped"] = [os.path.basename(p) for p in csv_files]  # csv would duplicate the chunks
+            info["csv_files"] = csv_files
         else:
             log_files = csv_files
-            info["skipped"] = []
+            info["csv_files"] = []
+        info["skipped"] = []
         name_parser = parse_mimir_filename
 
     fixes, imus, raws = [], [], []
@@ -359,6 +390,24 @@ def load_app(parent, role):
     info["fixes"] = pd.DataFrame(fixes)
     info["imu"] = pd.DataFrame(imus)
     info["raw"] = pd.DataFrame(raws)
+
+    # If the second app also wrote merged CSV file(s), parse them separately
+    # so they can be cross-checked against the chunk files.
+    info["csv"] = None
+    if role == "other" and info.get("csv_files"):
+        cf, ci, cr = [], [], []
+        for path in info["csv_files"]:
+            parsed = parse_log_file(path)
+            for rec in parsed["fix"]:
+                rec["src"] = os.path.basename(path)
+                cf.append(rec)
+            for rec in parsed["imu"]:
+                rec["src"] = os.path.basename(path)
+                ci.append(rec)
+            for rec in parsed["raw"]:
+                rec["src"] = os.path.basename(path)
+                cr.append(rec)
+        info["csv"] = {"fixes": pd.DataFrame(cf), "imu": pd.DataFrame(ci), "raw": pd.DataFrame(cr)}
     return info
 
 
@@ -369,6 +418,58 @@ def detect_role(parent):
     if find_files(parent, "log_*.txt") or find_files(parent, "*.csv"):
         return "other"
     return None
+
+
+def crosscheck_chunks_vs_csv(app, say):
+    """Cross-check the second app's fixed-size chunk files against its merged
+    CSV file. They are supposed to contain the same records; here we VERIFY
+    that instead of assuming it: we compare record counts, the set of
+    timestamps, and the actual values at matching timestamps. Any difference
+    is printed."""
+    csvd = app.get("csv")
+    say("\n--- cross-check for '" + app["parent"] + "': chunk files vs merged CSV ---")
+    if not csvd:
+        say("  no separate CSV file found; nothing to cross-check")
+        return
+    say(f"  chunk files: {len(app['files'])}, CSV files: {len(app['csv_files'])} "
+        f"e.g. {os.path.basename(app['csv_files'][0])}")
+    for label, cdf, vdf in (("Fix", app["fixes"], csvd["fixes"]),
+                            ("IMU", app["imu"], csvd["imu"]),
+                            ("Raw", app["raw"], csvd["raw"])):
+        c_times = cdf["time_ms"].dropna().astype("int64") if len(cdf) else pd.Series(dtype="int64")
+        v_times = vdf["time_ms"].dropna().astype("int64") if len(vdf) else pd.Series(dtype="int64")
+        only_chunks = sorted(set(c_times) - set(v_times))
+        only_csv = sorted(set(v_times) - set(c_times))
+        say(f"  {label:4s}: records in chunks={len(c_times)}, in CSV={len(v_times)}, "
+            f"timestamps only in chunks={len(only_chunks)}, only in CSV={len(only_csv)}")
+        if only_csv:
+            say(f"       CSV-only timestamps (first 5): {[fmt_ts(t) for t in only_csv[:5]]}")
+        if only_chunks:
+            say(f"       chunk-only timestamps (first 5): {[fmt_ts(t) for t in only_chunks[:5]]}")
+    # value agreement at matching timestamps
+    if len(app["fixes"]) and len(csvd["fixes"]):
+        c = app["fixes"].drop_duplicates(subset=["time_ms"])
+        v = csvd["fixes"].drop_duplicates(subset=["time_ms"])
+        m = c.merge(v, on="time_ms", suffixes=("_chunk", "_csv"), how="inner")
+        for col in ("lat", "lon", "alt"):
+            a, b = m[f"{col}_chunk"], m[f"{col}_csv"]
+            both = a.notna() & b.notna()
+            mism = int((both & ((a - b).abs() > 1e-9)).sum())
+            say(f"  Fix.{col}: matched timestamps={int(both.sum())}, value mismatches={mism}, "
+                f"missing in CSV={int((a.notna() & b.isna()).sum())}")
+    if len(app["imu"]) and len(csvd["imu"]):
+        c = app["imu"].drop_duplicates(subset=["time_ms", "sensor"])
+        v = csvd["imu"].drop_duplicates(subset=["time_ms", "sensor"])
+        m = c.merge(v, on=["time_ms", "sensor"], suffixes=("_chunk", "_csv"), how="inner")
+        for sensor in sorted(m["sensor"].unique()):
+            ms = m[m["sensor"] == sensor]
+            for col in ("x", "y", "z"):
+                a, b = ms[f"{col}_chunk"], ms[f"{col}_csv"]
+                both = a.notna() & b.notna()
+                mism = int((both & ((a - b).abs() > 1e-9)).sum())
+                empty_csv = int((a.notna() & b.isna()).sum())
+                say(f"  IMU {sensor}.{col}: matched={int(both.sum())}, value mismatches={mism}, "
+                    f"value empty in CSV={empty_csv}")
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +608,9 @@ def main():
         if app["skipped"]:
             say(f"  files skipped (not needed for this comparison): {len(app['skipped'])} "
                 f"e.g. {app['skipped'][:3]}")
+        if app.get("csv_files"):
+            say(f"  merged CSV file(s) also found and parsed (cross-checked below): "
+                f"{len(app['csv_files'])} e.g. {os.path.basename(app['csv_files'][0])}")
         for kind in ("fixes", "imu", "raw"):
             df = app[kind]
             if len(df):
@@ -528,6 +632,11 @@ def main():
             med = float(np.median(offsets_h))
             say(f"  file-name time minus in-file UTC time: {med:+.2f} h "
                 f"(file names are ahead of the UTC timestamps inside the files by this amount)")
+
+    # cross-check the second app's chunk files against its merged CSV (if any)
+    for name, app in apps:
+        if app.get("csv"):
+            crosscheck_chunks_vs_csv(app, say)
 
     # ------------------------------------------------------------- overlap
     def time_range(app):

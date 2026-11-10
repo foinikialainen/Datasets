@@ -24,7 +24,8 @@ Precise satellite orbit products obtained from the International GNSS Service (I
 `compare_apps.py` compares the data recorded simultaneously by GNSSLogger (`GNSSLogger/`)
 and by the second app (`MIMIR/`). You only pass the two parent directories - the script
 finds all data files inside them by itself (GNSSLogger `.txt` logs, or the second app's
-fixed-size chunk files `log_*.txt`):
+fixed-size chunk files `log_*.txt`; if the app also wrote a merged `*.csv`, it is parsed
+and cross-checked against the chunks):
 
 ```bash
 pip install -r requirements.txt
