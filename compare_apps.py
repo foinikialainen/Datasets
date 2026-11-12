@@ -476,11 +476,14 @@ def crosscheck_chunks_vs_csv(app, say):
 # Clock-health analysis (1970 jumps, backward jumps, gaps)
 # ---------------------------------------------------------------------------
 
-def clock_health(times_ms, gap_min_ms, backward_min_ms):
+def clock_health(times_ms, gap_min_ms, backward_min_ms, epoch_max_ms=EPOCH_JUMP_MAX_MS):
     """Analyse a series of timestamps (in the order they were logged).
 
     Returns a dict with statistics and a list of 'events':
-      - 'epoch'   : timestamp jumped to ~1970 (below EPOCH_JUMP_MAX_MS)
+      - 'epoch'   : timestamp jumped to ~1970 (below epoch_max_ms; for the wall
+                    clock this is EPOCH_JUMP_MAX_MS = 1 Jan 2000 in unix ms, for
+                    the uptime clock we pass a small value like 60 s, because
+                    an uptime clock near zero means it was reset)
       - 'backward': clock jumped backwards by more than the threshold
       - 'gap'     : no data logged for longer than the threshold
     The thresholds are adaptive: normally samples arrive every `p90` ms, so a
@@ -508,7 +511,7 @@ def clock_health(times_ms, gap_min_ms, backward_min_ms):
                   gap_thr_ms=gap_thr, backward_thr_ms=back_thr)
     for i, d in enumerate(dts):
         kind = None
-        if t[i + 1] < EPOCH_JUMP_MAX_MS:
+        if t[i + 1] < epoch_max_ms:
             kind = "epoch"
             result["n_epoch"] += 1
         elif d < -back_thr:
@@ -523,10 +526,18 @@ def clock_health(times_ms, gap_min_ms, backward_min_ms):
 
 
 def wall_vs_uptime_clock(imu_df):
-    """Sanity check: each IMU record carries both the wall clock (Unix ms) and
-    the device uptime clock (elapsedRealtimeNanos). Their difference should be
-    constant. If the wall clock jumps to 1970, this difference suddenly changes,
-    so we count records that disagree with the typical difference by > 60 s."""
+    """Cross-check between the two clocks stored in each IMU record: the wall
+    clock (Unix ms) and the device uptime clock (elapsedRealtimeNanos). Normally
+    their difference is constant, and we count records that disagree with the
+    typical difference by > 60 s.
+
+    IMPORTANT LIMITATION (verified on the example data): the two clocks usually
+    jump TOGETHER - when a record's wall clock jumps, its uptime clock jumps by
+    the same amount, so the difference stays constant and this check sees
+    nothing. A 1970-style jump where BOTH clocks go to ~0 is therefore only
+    caught by checking each clock on its own (the absolute 'epoch' threshold
+    and the step detection in clock_health, now run on BOTH clocks). This
+    offset check only catches a jump of ONE clock relative to the other."""
     df = imu_df.dropna(subset=["time_ms", "elapsed_ns"])
     if df.empty:
         return None
@@ -666,24 +677,40 @@ def main():
         say(f"\n--- {name} ---")
         groups = {}
         if len(app["fixes"]):
-            groups["Fix"] = app["fixes"]["time_ms"].to_numpy()
+            groups["Fix"] = app["fixes"]
         if len(app["raw"]):
-            groups["Raw"] = app["raw"]["time_ms"].to_numpy()
+            groups["Raw"] = app["raw"]
         if len(app["imu"]):
             for sensor, g in app["imu"].groupby("sensor"):
-                groups[f"IMU:{sensor}"] = g["time_ms"].to_numpy()
+                groups[f"IMU:{sensor}"] = g
         # We analyse the timestamps in the order they were logged (records in
         # file order, chunk files in file-name order). That is what reveals
         # clock jumps and logging gaps. (For a chunked app, records are written
         # in bursts per chunk file, so a step of about one chunk length between
         # files is normal.)
-        for label, times in groups.items():
+        for label, df in groups.items():
+            times = df["time_ms"].to_numpy()
             h = clock_health(times, args.gap_ms, args.backward_ms)
             health[(name, label)] = h
             rate = (1000.0 / h["median_dt"]) if h["median_dt"] else float("nan")
             say(f"  {label:14s} n={h['n']:7d}  median dt={h['median_dt']:8.1f} ms (~{rate:6.2f} Hz)  "
                 f"max dt={h['max_dt']:9.1f} ms  |  1970-jumps={h['n_epoch']}  "
                 f"backward={h['n_backward']}  gaps(>{h['gap_thr_ms']:.0f} ms)={h['n_gap']}")
+            # Also check the UPTIME clock (elapsedRealtimeNanos) stored in the
+            # same records. Each clock is checked on its own, because the two
+            # clocks usually jump TOGETHER (then their difference stays
+            # constant and cannot reveal the jump). For the uptime clock,
+            # "near zero" means < 60 s of uptime, i.e. the clock was reset.
+            if "elapsed_ns" in df.columns and df["elapsed_ns"].notna().any():
+                up = df.dropna(subset=["elapsed_ns"])
+                h_up = clock_health(up["elapsed_ns"].to_numpy() / 1e6, args.gap_ms, args.backward_ms,
+                                    epoch_max_ms=60_000)
+                health[(name, label + " [uptime]")] = h_up
+                wall_idx = {ev[0] for ev in h["events"]}
+                up_idx = {ev[0] for ev in h_up["events"]}
+                say(f"  {label:14s} uptime clock elapsedRealtimeNanos: reset-jumps={h_up['n_epoch']}  "
+                    f"backward={h_up['n_backward']}  gaps(>{h_up['gap_thr_ms']:.0f} ms)={h_up['n_gap']}  |  "
+                    f"events at the same record in both clocks: {len(wall_idx & up_idx)}/{len(wall_idx)}")
         # wall-clock vs uptime-clock check on IMU records
         for sensor, g in (app["imu"].groupby("sensor") if len(app["imu"]) else []):
             chk = wall_vs_uptime_clock(g)
@@ -693,7 +720,7 @@ def main():
         # detailed events (in log order; consecutive duplicates collapsed, because
         # a chunked app may re-log the identical stale record in every chunk)
         say("  detailed events (in log order, duplicates collapsed):")
-        for label, times in groups.items():
+        for label in groups:
             h = health[(name, label)]
             if not h["events"]:
                 continue
